@@ -1,0 +1,282 @@
+from secrets import token_bytes
+
+
+# ACORN class
+class ACORN128V3:
+    # constructor with key and initialization vector
+    def __init__(self, _key, _iv):
+        self.state = [0] * 293
+        self.key = _key
+        self.iv = _iv
+
+    # boolean majority function
+    @staticmethod
+    def maj(x, y, z):
+        return (x & y) ^ (x & z) ^ (y & z)
+
+    # boolean choice function
+    @staticmethod
+    def ch(x, y, z):
+        return (x & y) ^ ((not x) & z)
+
+    # generating the key stream bit
+    def KSG128(self):
+        return (self.state[12]
+                ^ self.state[154]
+                ^ self.maj(self.state[235], self.state[61], self.state[193])
+                ^ self.ch(self.state[230], self.state[111], self.state[66]))
+
+    # generating the feedback bit
+    def FBK128(self, cai, cbi, k):
+        return (self.state[0]
+                ^ (not self.state[107])
+                ^ self.maj(self.state[244], self.state[23], self.state[160])
+                ^ (cai & self.state[196])
+                ^ (cbi & k))
+
+    # the state update function: common to both encryption and decryption
+    def state_update128(self, cai, cbi):
+
+        # step 1: update using six LFSRs
+        self.state[289] ^= self.state[235] ^ self.state[230]
+        self.state[230] ^= self.state[196] ^ self.state[193]
+        self.state[193] ^= self.state[160] ^ self.state[154]
+        self.state[154] ^= self.state[111] ^ self.state[107]
+        self.state[107] ^= self.state[66] ^ self.state[61]
+        self.state[61] ^= self.state[23] ^ self.state[0]
+
+        # step 2: generate key stream bit
+        k = self.KSG128()
+
+        # step 3: generate the nonlinear feedback bit
+        f = self.FBK128(cai, cbi, k)
+
+        # step 4: shift the 293-bit register
+        for i in range(292):
+            self.state[i] = self.state[i + 1]
+
+        return f, k
+
+    # state update function for 1 bit encryption
+    def encrypt_state_update128_1bit(self, pti, cai, cbi):
+
+        f, k = self.state_update128(cai, cbi)
+
+        self.state[292] = f ^ pti
+
+        return k ^ pti, k
+
+    # state update function for 1 bit decryption
+    def decrypt_state_update128_1bit(self, cti, cai, cbi):
+
+        f, k = self.state_update128(cai, cbi)
+
+        pti = k ^ cti
+
+        self.state[292] = f ^ pti
+
+        return pti
+
+    # encryption function for 1 byte
+    def encrypt_1byte(self, ptb, cab, cbb):
+        ctb = 0
+        self.__ksb = 0
+
+        # loop for each bit in byte
+        for i in range(8):
+
+            # right shift each bit in ca/cb 1 space to set each bit
+            ca = (cab >> i) & 1
+            cb = (cbb >> i) & 1
+
+            pti = (ptb >> i) & 1
+
+            cti, k = self.encrypt_state_update128_1bit(pti, ca, cb)
+
+            ctb |= (cti << i)
+            self.__ksb |= (k << i)
+
+        return ctb
+
+    # decryption function for 1 byte
+    def decrypt_1byte(self, ctb, cab, cbb):
+        ptb = 0
+
+        # loop for each bit in byte
+        for i in range(8):
+
+            # right shift each bit in ca/cb 1 space to set each bit
+            ca = (cab >> i) & 1
+            cb = (cbb >> i) & 1
+
+            cti = (ctb >> i) & 1
+
+            pti = self.decrypt_state_update128_1bit(cti, ca, cb)
+
+            ptb |= (pti << i)
+
+        return ptb
+
+    # initialization function
+    def initialize(self):
+
+        # step 1: initialize the states to zero
+        self.state = [0] * 293
+
+        # step 2: loading the key and initialization vector
+        m = ([] + self.key
+             + self.iv
+             + [self.key[i & 15] for i in range(32, 224)])
+        m[32] ^= 1
+
+        # step 3: update the states
+        for i in range(224):
+            self.encrypt_1byte(m[i], 255, 255)
+
+    # finalization function with authentication tag generation
+    def finalize(self):
+
+        mac = [0] * 16
+
+        # run for 768 (bit) steps
+        for i in range(96):
+            self.encrypt_1byte(0, 255, 255)
+
+            if i >= 80:
+
+                # create authentication tag
+                mac[i - 80] = self.__ksb
+
+                # security analysis; used to display key stream
+                # print(self.__ksb)
+
+        return mac
+
+    # security analysis; printing final state
+    # def final_state(self):
+    #    for i, value in enumerate(self.state):
+    #        print(f"State[{i}]: {value}")
+
+    # encryption or decryption method from message and associated data
+    def encrypt_decrypt(self, m, ad, encrypt):
+
+        # initialize ACORN
+        self.initialize()
+
+        # process associated data
+        for adi in ad:
+            self.encrypt_1byte(adi, 255, 255)
+        for i in range(32):
+            self.encrypt_1byte(1 if i == 0 else 0, 255 if i < 16 else 0, 1)
+
+        c = []
+
+        # determine encryption or decryption
+        ed_func = self.encrypt_1byte if encrypt else self.decrypt_1byte
+
+        # add encrypted/decrypted text
+        for mi in m:
+            c.append(ed_func(mi, 255, 0))
+
+        for i in range(32):
+            self.encrypt_1byte(1 if i == 0 else 0, 255 if i < 16 else 0, 0)
+
+        # finalization
+        mac = self.finalize()
+
+        # self.final_state()
+
+        return c, mac
+
+    # encryption method for plaintext and associated data
+    def encrypt(self, _plaintext, _associated_data):
+        return self.encrypt_decrypt(_plaintext, _associated_data, True)
+
+    # decryption method for ciphertext and associated data
+    def decrypt(self, _ciphertext, _associated_data, _auth_tag):
+        _plaintext, _new_auth_tag = self.encrypt_decrypt(_ciphertext, _associated_data, False)
+
+        # to stop incorrect authentication tag and plaintext being outputted
+        if _new_auth_tag != _auth_tag:
+            raise ValueError("Authentication tag does not match")
+
+        return _plaintext, _new_auth_tag
+
+
+# modifications to output for easier reading
+def pretty_print(message, value):
+    print(message.ljust(30), value)
+
+
+def print_separator():
+    print('\n' + '-' * 64)
+
+
+# testing variables
+if __name__ == "__main__":
+
+    # key generation (16 bytes)
+    key = token_bytes(16)
+    key_bytes = list(key)
+
+    # security analysis; manual key generation
+    # key = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    # key_bytes = list(key)
+
+    # initialization vector generation (16 bytes)
+    iv = token_bytes(16)
+    iv_bytes = list(iv)
+
+    # security analysis; manual iv generation
+    # iv = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    # iv_bytes = list(iv)
+
+    # print the key and initialization vector
+    # remove .hex() in manual generation
+    pretty_print("\nKey:", key.hex())
+    pretty_print("\nInitialization Vector:", iv.hex())
+
+    print_separator()
+
+    # plaintext creation
+    plaintext = token_bytes(4)  # example plaintext
+    plaintext_bytes = list(plaintext)
+
+    # security analysis; manual plaintext generation
+    # plaintext = [0] * 32
+    # plaintext_bytes = list(plaintext)
+
+    # associated data creation
+    associated_data = []
+    associated_data_bytes = list(associated_data)
+
+    # print plaintext and associated data
+    pretty_print("\nPlaintext:", plaintext.hex())
+    pretty_print("\nAssociated Data:", associated_data)
+
+    print_separator()
+
+    # define class
+    acorn = ACORN128V3(key_bytes, iv_bytes)
+
+    # encryption
+    ciphertext_bytes, auth_tag_bytes = acorn.encrypt(plaintext_bytes, associated_data_bytes)
+    pretty_print("\nCiphertext:", bytes(ciphertext_bytes).hex())
+    pretty_print("\nAuthentication Tag:", bytes(auth_tag_bytes).hex())
+
+    print_separator()
+
+    # decryption
+    new_plaintext_bytes, new_auth_tag_bytes = acorn.decrypt(ciphertext_bytes, associated_data_bytes, auth_tag_bytes)
+    pretty_print("\nNew Plaintext:", bytes(new_plaintext_bytes).hex())
+    pretty_print("\nMatches Original Plaintext:", new_plaintext_bytes == plaintext_bytes)
+    pretty_print("\nNew Auth Tag:", bytes(new_auth_tag_bytes).hex())
+    pretty_print("\nMatches Original Auth Tag:", new_auth_tag_bytes == auth_tag_bytes)
+
+    print()
